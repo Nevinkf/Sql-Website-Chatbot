@@ -7,6 +7,49 @@ import sqlite3 from 'sqlite3';
 
 const __dirname = path.resolve();
 dotenv.config();
+<<<<<<< HEAD
+=======
+// Database setup
+const db = new sqlite3.Database(path.join(__dirname, 'database.db'))
+
+db.run(`CREATE TABLE IF NOT EXISTS test (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT,
+  email TEXT)`);
+
+
+// db.run("INSERT INTO test (name, email) VALUES (?, ?)", ["Alice", "alice@example.com"], function(err) {
+// if (err) {
+//   console.error("Insert error:", err);
+// } else {
+//   console.log("Inserted row with id:", this.lastID);
+// }
+// });
+
+let dbSchema = "";
+
+db.all("SELECT name, sql FROM sqlite_master WHERE type='table'", [], (err, rows) => {
+  if (err) throw err;
+  rows.forEach(row => {
+    dbSchema += `Table: ${row.name}\nSchema: ${row.sql}\n`;
+  });
+  resolve(dbSchema);
+});
+
+console.log("Database schema loaded:\n", dbSchema);
+
+// AI Setup
+const openai = new OpenAI({apiKey: process.env.OPENAI_API_KEY})
+let messageHistoryChat = [
+  {role: "system", content: "You are an expert SQL summarizer. You will be given the results of an SQL query and you will list and then summarize the results."},
+];
+
+let messageHistorySQL = [
+  {role: "system", content: `You are an SQL translator. Translate the user's message into an SQL query using the following schema: ${dbSchema}`},
+];
+
+console.log(messageHistorySQL[0].content); // Debugging line to check the initial system message
+>>>>>>> 9aca24f0fec104f98d2f5d987f91fa5299ef41d0
 
 // Database setup
 const db = new sqlite3.Database(path.join(__dirname, 'database.db'))
@@ -105,7 +148,10 @@ function queryDatabase(sqlQuery) {
 function determineIfQuery(message) {
 
 }
+<<<<<<< HEAD
 
 function loadDBSchema() {
   return new Promise
 }
+=======
+>>>>>>> 9aca24f0fec104f98d2f5d987f91fa5299ef41d0
