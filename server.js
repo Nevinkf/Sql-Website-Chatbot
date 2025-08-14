@@ -72,6 +72,7 @@ app.post('/api/chat', async (req, res) => {
   
     // Summarize the SQL query results
     const sqlSummary = await summarizeSQLQueryResults(sqlQuery, dbResponse);
+    console.log(messageHistorySQL.length, messageHistory.length);
     res.json({reply: sqlSummary});
   } catch (error) {
     console.error("Error processing chat message:", error);
@@ -85,6 +86,7 @@ app.post('/api/chat', async (req, res) => {
  * @returns Translated SQL query as a string.
  */
 async function convertMessageIntoSQL(message) {
+  trimHistoryPairs(messageHistorySQL, 5); // Keep the last 5 pairs of user and assistant messages
   messageHistorySQL.push({role: "user", content: `${message}`});
   const translatedMessage = await openai.chat.completions.create({
     model: "gpt-5",
@@ -103,13 +105,27 @@ async function convertMessageIntoSQL(message) {
  * @returns Summary of the SQL query results as a string.
  */
 async function summarizeSQLQueryResults(sqlQuery, results) {
-   messageHistory.push({role: "user", content: `SQL Query: ${sqlQuery}\n\nResults: ${results}`});
-    const response = await openai.chat.completions.create({
-      model: "gpt-5",
-      messages: messageHistory
-    });
-    messageHistory.push({role: "assistant", content: response.choices[0].message.content});
+  trimHistoryPairs(messageHistory, 5); // Keep the last 5 pairs of user and assistant messages
+  messageHistory.push({role: "user", content: `SQL Query: ${sqlQuery}\n\nResults: ${results}`});
+  const response = await openai.chat.completions.create({
+    model: "gpt-5",
+    messages: messageHistory
+  });
+  messageHistory.push({role: "assistant", content: response.choices[0].message.content});
   return response.choices[0].message.content;
+}
+
+/**
+ * Trim the message history to keep only the most recent pairs of user and assistant messages.
+ * This helps to manage the context size for the AI model.
+ * @param {*} history Message history array to trim.
+ * @param {*} maxPairs Amount of user-assistant pairs to keep in the history.
+ */
+function trimHistoryPairs(history, maxPairs) {
+  const allowedPairs = 1 + (maxPairs * 2);
+  while (history.length > allowedPairs) {
+    history.splice(1, 2); // Remove the oldest user and assistant messages
+  }
 }
 
 /**
