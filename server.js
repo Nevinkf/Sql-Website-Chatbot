@@ -1,6 +1,6 @@
 import OpenAI from 'openai';
 import dotenv from 'dotenv';
-import express from 'express';
+import express, { raw } from 'express';
 import cors from 'cors';
 import path from 'path';
 import sqlite3 from 'sqlite3';
@@ -50,18 +50,40 @@ app.post('/api/chat', async (req, res) => {
     return res.status(400).json({ error: "No message provided in request body" });
   }
   try {
-    const sqlQuery = await convertMessageIntoSQL(message);
+    const rawSQLQuery = await convertMessageIntoSQL(message);
+    const sqlQuery = stripMarkdownCodeBlock(rawSQLQuery);
+    console.log("Translated Message: ", sqlQuery);
+
     const queryType = await determineQueryType(sqlQuery);
     let dbResponse;
 
-    // Depending on the type of SQL query, execute it and handle the response
-    if (queryType === "SELECT") {
-      dbResponse = JSON.stringify(await queryDatabase(sqlQuery));
-    } else if (queryType === "INSERT" || queryType === "UPDATE" || queryType === "DELETE") {
-      dbResponse = await runDatabase(sqlQuery);
-    } else {
-      dbRepsonse = await runDatabase(sqlQuery);
+    try { 
+       if (queryType === "SELECT") {
+        dbResponse = await queryDatabase(sqlQuery);
+      } else if (queryType === "INSERT" || queryType === "UPDATE" || queryType === "DELETE") {
+        dbResponse = await runDatabase(sqlQuery);
+      } else {
+        dbResponse = await runDatabase(sqlQuery);
+      }
+
+    } catch (dbError) {
+      console.log("Database Error:", dbError);
+      console.error("Database Error:", {
+        message: dbError.message,
+        code: dbError.code,
+        sql: dbError.sql // see helpers below
+      });
+
+      // Try summaizer to provide feedback on the error
+      const errorSummary = await summarizeSQLQueryResults(sqlQuery, dbError.message);
+      return res.status(400).json({
+        error: dbError.message,
+        details: dbError.code || "SQLITE_ERROR",
+        reply: errorSummary
+      });
     }
+
+    console.log("Database Success");
 
     // After each query, reload the schema and update the system prompt
     dbSchema = await loadDBSchema();
@@ -71,14 +93,24 @@ app.post('/api/chat', async (req, res) => {
     }
   
     // Summarize the SQL query results
-    const sqlSummary = await summarizeSQLQueryResults(sqlQuery, dbResponse);
-    console.log(messageHistorySQL.length, messageHistory.length);
+    const sqlSummary = await summarizeSQLQueryResults(sqlQuery, JSON.stringify(dbResponse));
     res.json({reply: sqlSummary});
   } catch (error) {
     console.error("Error processing chat message:", error);
     res.status(500).json({error: "Failed to process chat message"});
   }
 });
+
+/**
+ * Strip Markdown code block syntax from the raw SQL query, so that it can be executed directly.
+ * This function removes the leading and trailing code fences (```) and any optional language labels.
+ * @param {*} rawSQLQuery Raw SQL query string that may contain Markdown code block syntax.
+ * @returns Cleaned SQL query string without Markdown syntax.
+ */
+function stripMarkdownCodeBlock(rawSQLQuery) {
+  // Remove leading/trailing code fences, optional language labels, and trim
+  return rawSQLQuery.replace(/^\s*```[\w]*\s*([\s\S]*?)\s*```/gm, '$1').trim();
+}
 
 /**
  * Convert a natural language message into an SQL query using OpenAI's GPT model.
@@ -89,12 +121,10 @@ async function convertMessageIntoSQL(message) {
   trimHistoryPairs(messageHistorySQL, 5); // Keep the last 5 pairs of user and assistant messages
   messageHistorySQL.push({role: "user", content: `${message}`});
   const translatedMessage = await openai.chat.completions.create({
-    model: "gpt-5",
+    model: "gpt-4o-mini",
     messages: messageHistorySQL
   })
   messageHistorySQL.push({role: "assistant", content: translatedMessage.choices[0].message.content});
-
-  console.log("Translated SQL Query:", translatedMessage.choices[0].message.content);
   return translatedMessage.choices[0].message.content;
 }
 
@@ -108,7 +138,7 @@ async function summarizeSQLQueryResults(sqlQuery, results) {
   trimHistoryPairs(messageHistory, 5); // Keep the last 5 pairs of user and assistant messages
   messageHistory.push({role: "user", content: `SQL Query: ${sqlQuery}\n\nResults: ${results}`});
   const response = await openai.chat.completions.create({
-    model: "gpt-5",
+    model: "gpt-4o-mini",
     messages: messageHistory
   });
   messageHistory.push({role: "assistant", content: response.choices[0].message.content});
@@ -133,8 +163,8 @@ function trimHistoryPairs(history, maxPairs) {
  * @param {*} sqlQuery SQL query string to analyze.
  * @returns String that indicates the type of SQL query (e.g., SELECT, INSERT, UPDATE, DELETE, DDL).
  */
-async function determineQueryType(sqlQuery) {
-  const lowerQuery = sqlQuery.toLowerCase();
+function determineQueryType(sqlQuery) {
+  const lowerQuery = sqlQuery.trim().toLowerCase();
   if (lowerQuery.startsWith("select")) {
     return "SELECT";
   } else if (lowerQuery.startsWith("insert")) {
@@ -160,7 +190,7 @@ function queryDatabase(sqlQuery) {
   return new Promise((resolve, reject) => {
     db.all(sqlQuery, [], (err, rows) => {
       if (err) {
-        reject(err);
+        return reject(normalizeSqliteError(err, sqlQuery));
       } else {
         resolve(rows);
       }
@@ -178,12 +208,26 @@ function runDatabase(sqlQuery) {
   return new Promise((resolve, reject) => {
     db.run(sqlQuery, [], function(err) {
       if (err) {
-        reject(err);
+        return reject(normalizeSqliteError(err, sqlQuery));
       } else {
         resolve({changes: this.changes});
       }
     });
   });
+}
+
+/**
+ * Normlize SQLite error to include a safe message, code, and the SQL that caused the error.
+ * Avoids exposing sensitive information from the database.
+ * @param {*} err Error object from SQLite.
+ * @param {*} sql Sql query that caused the error.
+ * @returns Error object with normalized properties.
+ */
+function normalizeSqliteError(err, sql) {
+  const e = new Error(err.message || "SQLite Error");
+  e.code = err.code || "SQLITE_ERROR";
+  e.sql = sql;
+  return e;
 }
 
 /**
