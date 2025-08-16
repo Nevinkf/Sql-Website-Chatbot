@@ -50,6 +50,12 @@ app.post('/api/chat', async (req, res) => {
     return res.status(400).json({ error: "No message provided in request body" });
   }
   try {
+    const messageIntent = await classifyMessageIntent(message);
+    if (messageIntent === "NOT_DATABASE_QUERY") {
+      // If the message is not a database query, state generic response.
+      return res.json({ reply: "This is not a database query. Please ask a question about the database." });
+    }
+
     const rawSQLQuery = await convertMessageIntoSQL(message);
     const sqlQuery = stripMarkdownCodeBlock(rawSQLQuery);
     console.log("Translated Message: ", sqlQuery);
@@ -67,13 +73,6 @@ app.post('/api/chat', async (req, res) => {
       }
 
     } catch (dbError) {
-      console.log("Database Error:", dbError);
-      console.error("Database Error:", {
-        message: dbError.message,
-        code: dbError.code,
-        sql: dbError.sql // see helpers below
-      });
-
       // Try summaizer to provide feedback on the error
       const errorSummary = await summarizeSQLQueryResults(sqlQuery, dbError.message);
       return res.status(400).json({
@@ -82,8 +81,6 @@ app.post('/api/chat', async (req, res) => {
         reply: errorSummary
       });
     }
-
-    console.log("Database Success");
 
     // After each query, reload the schema and update the system prompt
     dbSchema = await loadDBSchema();
@@ -146,19 +143,6 @@ async function summarizeSQLQueryResults(sqlQuery, results) {
 }
 
 /**
- * Trim the message history to keep only the most recent pairs of user and assistant messages.
- * This helps to manage the context size for the AI model.
- * @param {*} history Message history array to trim.
- * @param {*} maxPairs Amount of user-assistant pairs to keep in the history.
- */
-function trimHistoryPairs(history, maxPairs) {
-  const allowedPairs = 1 + (maxPairs * 2);
-  while (history.length > allowedPairs) {
-    history.splice(1, 2); // Remove the oldest user and assistant messages
-  }
-}
-
-/**
  * Determine the type of SQL query based on its content.
  * @param {*} sqlQuery SQL query string to analyze.
  * @returns String that indicates the type of SQL query (e.g., SELECT, INSERT, UPDATE, DELETE, DDL).
@@ -180,6 +164,41 @@ function determineQueryType(sqlQuery) {
   }
 }
 
+/**
+ * Classify the intent of a message to determine if it is a database query or not.
+ * Used to filter out non-database related messages.
+ * @param {*} message Message text to classify.
+ * @returns String indicating the intent: "DATABASE_QUERY" or "NOT_DATABASE_QUERY".
+ */
+async function classifyMessageIntent(message) {
+  const intentPrompt = [
+    {role: "system", content: "You are an expert intent classifier. Given a natural language message, identifiy if the message intends to query the database. Reply only with 'DATABASE_QUERY' or 'NOT_DATABASE_QUERY'."},
+    {role: "user", content: "Show me all users who signed up last week."},
+    {role: "assistant", content: "DATABASE_QUERY"},
+    {role: "user", content: "Tell me a joke."},
+    {role: "assistant", content: "NOT_DATABASE_QUERY"},
+    {role: "user", content: message}
+  ]
+
+  const response = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    messages: intentPrompt
+  });
+  return response.choices[0].message.content.trim();
+}
+
+/**
+ * Trim the message history to keep only the most recent pairs of user and assistant messages.
+ * This helps to manage the context size for the AI model.
+ * @param {*} history Message history array to trim.
+ * @param {*} maxPairs Amount of user-assistant pairs to keep in the history.
+ */
+function trimHistoryPairs(history, maxPairs) {
+  const allowedPairs = 1 + (maxPairs * 2);
+  while (history.length > allowedPairs) {
+    history.splice(1, 2); // Remove the oldest user and assistant messages
+  }
+}
 
 /**
  * Query the database with the provided SQL query.
