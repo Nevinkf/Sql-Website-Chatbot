@@ -2,101 +2,245 @@ import OpenAI from 'openai';
 import dotenv from 'dotenv';
 import express, { raw } from 'express';
 import cors from 'cors';
-import path from 'path';
+import path, { normalize } from 'path';
 import sqlite3 from 'sqlite3';
+import mysql from 'mysql2/promise';
+import {Client as SSHClient} from 'ssh2';
 
 const __dirname = path.resolve();
 dotenv.config();
 
-// Initialize SQLite database connection
-const db = new sqlite3.Database(path.join(__dirname, 'database.db'));
-let dbSchema = "";
-const PORT = process.env.PORT || 3001;
-const app = express();
-
-// Register middleware before rout4es
-app.use(express.static(__dirname));
-app.use(cors());
-app.use(express.json());
-
-// Message histories for SQL translation and summarization
+const DB_TYPE = process.env.DB_TYPE || "sqlite"; // Default to SQLite if not specified
+// AI Setup
+const openai = new OpenAI({apiKey: process.env.OPENAI_API_KEY})
+ // Message histories for SQL translation and summarization
 let messageHistory = [];
 let messageHistorySQL = [];
 
-// Load the database schema at startup, then intialize message histories
-loadDBSchema().then((schema) => {
-  dbSchema = schema;
-  // Initialize message histories with loaded schema
-  messageHistorySQL = [
-    {role: "system", content: `You are an expert SQL translator. You will be given a natural language request and you will translate it into an SQL query for the following database schema:\n\n${JSON.stringify(dbSchema)}, your response will only contain sql code, no explanations or comments.`}
-  ];
-  messageHistory = [
-    {role: "system", content: "You are an expert SQL query results summarizer. Given the SQL query executed and its results or status, list and summarize the results. If the query was retrieving information, summarize the returned rows. If the query added, removed, or modified tables, columns, or rows, state whether the operation was successful."}
-  ];
+let dbSchema = "";
 
-  // Start the server after loading the schema
-  app.listen(PORT, () => {
-    console.log(`Server is running on http://localhost:${PORT}`);
-  });
-});
+// Initialize SQLite database connection
+let db;
+let queryDatabase;
+let runDatabase;
+let loadDBSchema;
+let normalizeSQLError;
 
-// AI Setup
-const openai = new OpenAI({apiKey: process.env.OPENAI_API_KEY})
-
-// Proccess chat messages
-app.post('/api/chat', async (req, res) => {
-  const { message } = req.body || {};
-  if (!message) {
-    return res.status(400).json({ error: "No message provided in request body" });
-  }
-  try {
-    const messageIntent = await classifyMessageIntent(message);
-    if (messageIntent === "NOT_DATABASE_QUERY") {
-      // If the message is not a database query, state generic response.
-      return res.json({ reply: "This is not a database query. Please ask a question about the database." });
+if (DB_TYPE === "sqlite") {
+  // Use SQLite database
+  db = new sqlite3.Database(path.join(__dirname, 'database.db'), (err) => {
+    if (err) {
+      console.error("Error opening SQLite database:", err.message);
+    } else {
+      console.log("Connected to SQLite database.");
     }
+  });
+  queryDatabase = function(sqlQuery) {
+    return new Promise((resolve, reject) => {
+      db.all(sqlQuery, [], (err, rows) => {
+        if (err) {
+          return reject(normalizeSQLError(err, sqlQuery));
+        } else {
+          resolve(rows);
+        }
+      });
+    });
+  }
+  runDatabase = function(sqlQuery) {
+    return new Promise((resolve, reject) => {
+      db.run(sqlQuery, [], function(err) {
+        if (err) {
+          return reject(normalizeSQLError(err, sqlQuery));
+        } else {
+          resolve({changes: this.changes});
+        }
+      });
+    });
+  }
+  loadDBSchema = function() {
+    return new Promise((resolve, reject) => {
+      db.all("SELECT name, sql FROM sqlite_master WHERE type='table'", [], (err, rows) => {
+        if (err) {
+          reject(err);
+        } else {
+          let schema = "";
+          rows.forEach(row => {
+            schema += `Table: ${row.name}\nSchema: ${row.sql}\n`;
+          });
+          resolve(schema);
+        }
+      });
+    });
+  }
+  normalizeSQLError = function(err, sql) {
+    const e = new Error(err.message || "SQLite Error");
+    e.code = err.code || "SQLITE_ERROR";
+    e.sql = sql;
+    return e;
+  }
+  startServer();
+} else if (DB_TYPE === "mysql") {
+  const sshConfig = {
+    host: process.env.SSH_HOST || 'localhost',
+    port: process.env.SSH_PORT || 22,
+    username: process.env.SSH_USERNAME || 'root',
+    password: process.env.SSH_PASSWORD || ''
+  }
 
-    const rawSQLQuery = await convertMessageIntoSQL(message);
-    const sqlQuery = stripMarkdownCodeBlock(rawSQLQuery);
-    console.log("Translated Message: ", sqlQuery);
+  const dbConfig = {
+    host: process.env.DB_HOST || 'localhost',
+    user: process.env.DB_USER  || 'root',
+    password: process.env.DB_PASSWORD || '',
+    database: process.env.DB_NAME || 'test'
+  }
 
-    const queryType = await determineQueryType(sqlQuery);
-    let dbResponse;
+  const ssh = new SSHClient();
+  ssh.on('ready', () => {
+    // Forward the lcoal port 3307 to remote MySQL port 3306
+    ssh.forwardOut('127.0.0.1', 3301, sshConfig.host, 3306, (err, stream) => {
+      if (err) throw err;
 
-    try { 
-       if (queryType === "SELECT") {
-        dbResponse = await queryDatabase(sqlQuery);
-      } else if (queryType === "INSERT" || queryType === "UPDATE" || queryType === "DELETE") {
-        dbResponse = await runDatabase(sqlQuery);
-      } else {
-        dbResponse = await runDatabase(sqlQuery);
+      mysql.createConnection({
+        ...dbConfig,
+        stream
+      }).then(connection => {
+        db = connection;
+        console.log("Connected to MySQL database via SSH tunnel.");
+        startServer();
+      }).catch((err) => {
+        console.error("Error connecting to MySQL database:", err.message);
+      });
+    });
+  }).connect(sshConfig);
+
+  queryDatabase = async function(sqlQuery) {
+    try {
+      const [rows] = await db.query(sqlQuery);
+      return rows;
+    } catch (err) {
+      throw normalizeSQLError(err, sqlQuery);
+    }
+  };
+  runDatabase = async function(sqlQuery) {
+    try {
+      const [result] = await db.query(sqlQuery);
+      return { changes: result.affectedRows };
+    } catch (err) {
+      throw normalizeSQLError(err, sqlQuery);
+    }
+  };
+  loadDBSchema = async function() {
+    const [tables] = await db.query("SELECT TABLE_NAME FROM information_schema.tables WHERE table_schema = ?", [dbConfig.database]);
+    let schema = "";
+    for (let tbl of tables) {
+      const [columns] = await db.query(
+        "SELECT COLUMN_NAME, COLUMN_TYPE FROM information_schema.columns WHERE table_schema = ? AND table_name = ?",
+        [dbConfig.database, tbl.TABLE_NAME]
+      );
+      schema += `Table: ${tbl.TABLE_NAME}\nSchema: `;
+      schema += columns.map(col => `${col.COLUMN_NAME} ${col.COLUMN_TYPE}`).join(', ');
+      schema += "\n";
+    }
+    return schema;
+  };
+  normalizeSQLError = function(err, sql) {
+    const e = new Error(err.message || "MySQL Error");
+    e.code = err.code || "MYSQL_ERROR";
+    e.sql = sql;
+    return e;
+  };
+} else {
+  throw new Error("Unsupported database type. Please set DB_TYPE to 'sqlite' or 'mysql'.");
+}
+
+if (DB_TYPE === "sqlite") {
+
+}
+
+/** 
+ * Start the Express server and set up routes for handling chat messages.
+*/
+function startServer() {
+  const PORT = process.env.PORT || 3001;
+
+  // Register middleware before rout4es
+  const app = express();
+  app.use(express.static(__dirname));
+  app.use(cors());
+  app.use(express.json());
+
+  // Load the database schema at startup, then intialize message histories
+  loadDBSchema().then((schema) => {
+    dbSchema = schema;
+    // Initialize message histories with loaded schema
+    messageHistorySQL = [
+      {role: "system", content: `You are an expert SQL translator. You will be given a natural language request and you will translate it into an SQL query, your response will only contain sql code, no explanations or comments.`}
+    ];
+    messageHistory = [
+      {role: "system", content: "You are an expert SQL query results summarizer. Given the SQL query executed and its results or status, list and summarize the results. If the query was retrieving information, summarize the returned rows. If the query added, removed, or modified tables, columns, or rows, state whether the operation was successful."}
+    ];
+
+    // Start the server after loading the schema
+    app.listen(PORT, () => {
+      console.log(`Server is running on http://localhost:${PORT}`);
+    });
+  });
+
+  // Proccess chat messages
+  app.post('/api/chat', async (req, res) => {
+    const { message } = req.body || {};
+    if (!message) {
+      return res.status(400).json({ error: "No message provided in request body" });
+    }
+    try {
+      const messageIntent = await classifyMessageIntent(message);
+      if (messageIntent === "NOT_DATABASE_QUERY") {
+        // If the message is not a database query, state generic response.
+        return res.json({ reply: "This is not a database query. Please ask a question about the database." });
       }
 
-    } catch (dbError) {
-      // Try summaizer to provide feedback on the error
-      const errorSummary = await summarizeSQLQueryResults(sqlQuery, dbError.message);
-      return res.status(400).json({
-        error: dbError.message,
-        details: dbError.code || "SQLITE_ERROR",
-        reply: errorSummary
-      });
-    }
+      const rawSQLQuery = await convertMessageIntoSQL(message);
+      const sqlQuery = stripMarkdownCodeBlock(rawSQLQuery);
+      console.log("Translated Message: ", sqlQuery);
 
-    // After each query, reload the schema and update the system prompt
-    dbSchema = await loadDBSchema();
-    // Replace the first system message in messageHistorySQL with the new schema
-    if (messageHistorySQL.length > 0 && messageHistorySQL[0].role === "system") {
-      messageHistorySQL[0].content = `You are an expert SQL translator. You will be given a natural language request and you will translate it into an SQL query for the following database schema:\n\n${JSON.stringify(dbSchema)}, your response will only contain sql code, no explanations or comments.`;
+      const queryType = await determineQueryType(sqlQuery);
+      let dbResponse;
+
+      try { 
+        if (queryType === "SELECT") {
+          dbResponse = await queryDatabase(sqlQuery);
+        } else if (queryType === "INSERT" || queryType === "UPDATE" || queryType === "DELETE") {
+          dbResponse = await runDatabase(sqlQuery);
+        } else {
+          dbResponse = await runDatabase(sqlQuery);
+        }
+
+      } catch (dbError) {
+        // Try summaizer to provide feedback on the error
+        const errorSummary = await summarizeSQLQueryResults(sqlQuery, dbError.message);
+        return res.status(400).json({
+          error: dbError.message,
+          details: dbError.code || "SQLITE_ERROR",
+          reply: errorSummary
+        });
+      }
+
+      // After each query, reload the schema and update the system prompt
+      // dbSchema = await loadDBSchema();
+      // Replace the first system message in messageHistorySQL with the new schema
+      if (messageHistorySQL.length > 0 && messageHistorySQL[0].role === "system") {
+        messageHistorySQL[0].content = `You are an expert SQL translator. You will be given a natural language request and you will translate it into an SQL query, your response will only contain sql code, no explanations or comments.`;
+      }
+    
+      // Summarize the SQL query results
+      const sqlSummary = await summarizeSQLQueryResults(sqlQuery, JSON.stringify(dbResponse));
+      res.json({reply: sqlSummary});
+    } catch (error) {
+      console.error("Error processing chat message:", error);
+      res.status(500).json({error: "Failed to process chat message"});
     }
-  
-    // Summarize the SQL query results
-    const sqlSummary = await summarizeSQLQueryResults(sqlQuery, JSON.stringify(dbResponse));
-    res.json({reply: sqlSummary});
-  } catch (error) {
-    console.error("Error processing chat message:", error);
-    res.status(500).json({error: "Failed to process chat message"});
-  }
-});
+  });
+}
 
 /**
  * Strip Markdown code block syntax from the raw SQL query, so that it can be executed directly.
@@ -200,71 +344,71 @@ function trimHistoryPairs(history, maxPairs) {
   }
 }
 
-/**
- * Query the database with the provided SQL query.
- * @param {*} sqlQuery SQL query string to execute.
- * @returns Promise that resolves with the query results or rejects with an error.
- */
-function queryDatabase(sqlQuery) {
-  return new Promise((resolve, reject) => {
-    db.all(sqlQuery, [], (err, rows) => {
-      if (err) {
-        return reject(normalizeSqliteError(err, sqlQuery));
-      } else {
-        resolve(rows);
-      }
-    });
-  });
-}
+// /**
+//  * Query the database with the provided SQL query.
+//  * @param {*} sqlQuery SQL query string to execute.
+//  * @returns Promise that resolves with the query results or rejects with an error.
+//  */
+// function queryDatabase(sqlQuery) {
+//   return new Promise((resolve, reject) => {
+//     db.all(sqlQuery, [], (err, rows) => {
+//       if (err) {
+//         return reject(normalizeSqliteError(err, sqlQuery));
+//       } else {
+//         resolve(rows);
+//       }
+//     });
+//   });
+// }
 
-/**
- * Run a SQL command that modifies the database (INSERT, UPDATE, DELETE).
- * This function does not return any rows, only the number of changes made.
- * @param {*} sqlQuery SQL command to execute.
- * @returns Promise that resolves with the number of changes made or rejects with an error.
- */
-function runDatabase(sqlQuery) {
-  return new Promise((resolve, reject) => {
-    db.run(sqlQuery, [], function(err) {
-      if (err) {
-        return reject(normalizeSqliteError(err, sqlQuery));
-      } else {
-        resolve({changes: this.changes});
-      }
-    });
-  });
-}
+// /**
+//  * Run a SQL command that modifies the database (INSERT, UPDATE, DELETE).
+//  * This function does not return any rows, only the number of changes made.
+//  * @param {*} sqlQuery SQL command to execute.
+//  * @returns Promise that resolves with the number of changes made or rejects with an error.
+//  */
+// function runDatabase(sqlQuery) {
+//   return new Promise((resolve, reject) => {
+//     db.run(sqlQuery, [], function(err) {
+//       if (err) {
+//         return reject(normalizeSqliteError(err, sqlQuery));
+//       } else {
+//         resolve({changes: this.changes});
+//       }
+//     });
+//   });
+// }
 
-/**
- * Normlize SQLite error to include a safe message, code, and the SQL that caused the error.
- * Avoids exposing sensitive information from the database.
- * @param {*} err Error object from SQLite.
- * @param {*} sql Sql query that caused the error.
- * @returns Error object with normalized properties.
- */
-function normalizeSqliteError(err, sql) {
-  const e = new Error(err.message || "SQLite Error");
-  e.code = err.code || "SQLITE_ERROR";
-  e.sql = sql;
-  return e;
-}
+// /**
+//  * Normlize SQLite error to include a safe message, code, and the SQL that caused the error.
+//  * Avoids exposing sensitive information from the database.
+//  * @param {*} err Error object from SQLite.
+//  * @param {*} sql Sql query that caused the error.
+//  * @returns Error object with normalized properties.
+//  */
+// function normalizeSqliteError(err, sql) {
+//   const e = new Error(err.message || "SQLite Error");
+//   e.code = err.code || "SQLITE_ERROR";
+//   e.sql = sql;
+//   return e;
+// }
 
-/**
- * Loads DB Schema from the SQLite database, so that AI can use it to generate SQL queries.
- * @returns Promise that resolves with the database schema as a string.
- */
-async function loadDBSchema() {
-  return new Promise((resolve, reject) => {
-    db.all("SELECT name, sql FROM sqlite_master WHERE type='table'", [], (err, rows) => {
-      if (err) {
-        reject(err);
-      } else {
-        let schema = "";
-        rows.forEach(row => {
-          schema += `Table: ${row.name}\nSchema: ${row.sql}\n`;
-        });
-        resolve(schema);
-      }
-    });
-  });
-}
+// /**
+//  * Loads DB Schema from the SQLite database, so that AI can use it to generate SQL queries.
+//  * @returns Promise that resolves with the database schema as a string.
+//  */
+// async function loadDBSchema() {
+//   return new Promise((resolve, reject) => {
+//     db.all("SELECT name, sql FROM sqlite_master WHERE type='table'", [], (err, rows) => {
+//       if (err) {
+//         reject(err);
+//       } else {
+//         let schema = "";
+//         rows.forEach(row => {
+//           schema += `Table: ${row.name}\nSchema: ${row.sql}\n`;
+//         });
+//         resolve(schema);
+//       }
+//     });
+//   });
+// }
